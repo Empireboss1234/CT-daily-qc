@@ -1,0 +1,774 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CT Daily QC Logbook | MedPhys QA</title>
+
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    
+    <style>
+        @media print {
+            @page { size: A4 portrait; margin: 12mm; }
+            .no-print { display: none !important; }
+            body { 
+                background: white; 
+                -webkit-print-color-adjust: exact; 
+                print-color-adjust: exact; 
+            }
+            .page-break { page-break-before: always; }
+            .break-inside-avoid { break-inside: avoid; page-break-inside: avoid; }
+            #report-content { width: 100%; max-width: 100%; margin: 0; padding: 0; }
+            canvas { max-width: 100% !important; }
+        }
+        
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 font-sans">
+
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useMemo, useRef } = React;
+
+        // --- Configuration & Constants for CT ---
+        const MACHINE_PROFILES = {
+            'canon_prime': { name: 'CT Canon Aquilion Prime' },
+            'ge_revo': { name: 'CT GE Revolution CT (Fast KV Switching)' },
+            'philips_7500': { name: 'CT Philips Spectral CT7500' }
+        };
+
+        const TOLERANCE = {
+            ctNumMin: -5.0, ctNumMax: 5.0,
+            unifMin: -10.0, unifMax: 10.0,
+            pctNoiseMin: -25.0, pctNoiseMax: 25.0,
+            gantryTempMin: 18.0, gantryTempMax: 24.0,
+            gantryHumidMin: 40.0, gantryHumidMax: 70.0
+        };
+
+        const CHECKLIST_ITEMS = [
+            { id: 'c1', label: 'Restart HOST computer', isWeekly: false },
+            { id: 'c2', label: 'Restart CIRS computer', isWeekly: true, excludeFrom: ['canon_prime', 'ge_revo'] },
+            { id: 'c3', label: 'Restart GANTRY (Stator, Rotor, Breaker)', isWeekly: false, excludeFrom: ['canon_prime', 'ge_revo'] },
+            { id: 'c4', label: 'Tube conditioning (warm-up)', isWeekly: false },
+            { id: 'c5', label: 'Air calibration', isWeekly: true },
+            { id: 'c6', label: 'Couch height display accuracy', isWeekly: false },
+            { id: 'c7', label: 'Couch position display accuracy', isWeekly: false },
+            { id: 'c8', label: 'Internal/External laser alignment accuracy', isWeekly: false },
+            { id: 'c9', label: 'Smooth couch movement', isWeekly: false },
+            { id: 'c10', label: 'Scan buttons functioning normally', isWeekly: false },
+            { id: 'c11', label: 'Gantry cleanliness', isWeekly: false },
+            { id: 'c12', label: 'Foot pedal couch controls (both sides)', isWeekly: false },
+            { id: 'c13', label: 'Monitor display & Window Width/Level normal', isWeekly: false },
+            { id: 'c14', label: 'Panel switches/lights/meters functioning', isWeekly: false },
+            { id: 'c15', label: '"X-ray on" indicator light functioning', isWeekly: false },
+            { id: 'c16', label: 'CT console keyboard functioning', isWeekly: false },
+            { id: 'c17', label: 'PACS, HIS, RIS connectivity', isWeekly: false },
+            { id: 'c18', label: 'Intercom / Microphone functioning', isWeekly: false },
+            { id: 'c19', label: 'CCTV monitor functioning', isWeekly: false },
+            { id: 'c20', label: 'Positioning aids complete', isWeekly: false },
+            { id: 'c21', label: 'QC equipment complete', isWeekly: false }
+        ];
+
+        // --- Utils ---
+        const generateId = () => Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
+        const formatDate = (dateStr) => new Date(dateStr).toLocaleDateString('en-GB');
+
+        const escapeCSV = (val) => {
+            if (val === null || val === undefined) return '""';
+            const str = String(val).replace(/"/g, '""');
+            return `"${str}"`; 
+        };
+
+        // --- Components ---
+        const Card = ({ title, children, className = "" }) => (
+            <div className={`bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden ${className}`}>
+                {title && <div className="px-6 py-4 border-b border-slate-100 font-semibold text-slate-700">{title}</div>}
+                <div className="p-6">{children}</div>
+            </div>
+        );
+
+        const TrendChart = ({ data, label, color, upperLimit, lowerLimit, showLimits = true }) => {
+            const canvasRef = useRef(null);
+            const chartInstanceRef = useRef(null);
+
+            useEffect(() => {
+                if (!canvasRef.current) return;
+                const ctx = canvasRef.current.getContext('2d');
+                if (chartInstanceRef.current) chartInstanceRef.current.destroy();
+
+                const validData = data.filter(d => d.value !== '' && d.value !== null && d.value !== undefined);
+                const dates = validData.map(d => new Date(d.date).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }));
+                const values = validData.map(d => parseFloat(d.value));
+                
+                const datasets = [{
+                    label: label,
+                    data: values,
+                    borderColor: color,
+                    backgroundColor: color + '20', 
+                    tension: 0.2,
+                    borderJoinStyle: 'round',
+                    pointRadius: 3,
+                    pointHoverRadius: 6
+                }];
+
+                if (showLimits && values.length > 0) {
+                    if (upperLimit !== undefined) datasets.push({ label: 'Upper Limit', data: values.map(() => upperLimit), borderColor: '#ef4444', borderDash: [5, 5], pointRadius: 0, borderWidth: 1.5, fill: false });
+                    if (lowerLimit !== undefined) datasets.push({ label: 'Lower Limit', data: values.map(() => lowerLimit), borderColor: '#ef4444', borderDash: [5, 5], pointRadius: 0, borderWidth: 1.5, fill: false });
+                }
+
+                chartInstanceRef.current = new Chart(ctx, {
+                    type: 'line',
+                    data: { labels: dates, datasets: datasets },
+                    options: {
+                        responsive: true, maintainAspectRatio: false,
+                        interaction: { mode: 'index', intersect: false },
+                        scales: { y: { display: true, title: { display: false } }, x: { ticks: { maxRotation: 45, minRotation: 0 } } },
+                        plugins: { legend: { position: 'top', labels: { boxWidth: 12, usePointStyle: true, font: { size: 10 } } } }
+                    }
+                });
+
+                return () => { if (chartInstanceRef.current) chartInstanceRef.current.destroy(); };
+            }, [data, label, color, upperLimit, lowerLimit, showLimits]);
+
+            return <canvas ref={canvasRef}></canvas>;
+        };
+
+        // --- Main Application ---
+        const App = () => {
+            // *** นำ URL จาก Google Apps Script (Deploy > Web App) มาใส่ตรงนี้ ***
+            const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxDXZSdQE4NdgrbSAI7jEfrYthMoFGib3RQqBgWx47-khTAJhAGpDkVNMHXSUN4H8QJyw/exec';
+            
+            const [activeTab, setActiveTab] = useState('new'); 
+            const [selectedMachine, setSelectedMachine] = useState('canon_prime');
+            const [records, setRecords] = useState([]);
+            const [editingId, setEditingId] = useState(null); 
+            const [isSubmitting, setIsSubmitting] = useState(false);
+            const [isLoadingData, setIsLoadingData] = useState(true);
+            
+            const [filterYear, setFilterYear] = useState(new Date().getFullYear().toString());
+            const [filterMonth, setFilterMonth] = useState('all');
+            
+            const [formData, setFormData] = useState({
+                date: new Date().toISOString().split('T')[0],
+                performedBy: '',
+                gantryTemp: '', gantryHumid: '', controlTemp: '', controlHumid: '',
+                ctNum1: '', ctNum2: '', ctNum3: '', ctNum4: '', ctNum5: '',
+                ctUniformity: '', imageNoise: '', pctImageNoise: '',
+                hasArtifact: 'no', artifactDesc: '',
+                checklist: {}, analysisComment: '', testConclusion: ''
+            });
+
+            // 1. โหลดข้อมูลจาก Google Sheets (Single Source of Truth)
+            useEffect(() => {
+                const fetchData = async () => {
+                    setIsLoadingData(true);
+                    try {
+                        const savedRecords = localStorage.getItem('ct_qa_records');
+                        if (savedRecords) setRecords(JSON.parse(savedRecords));
+
+                        if(SCRIPT_URL === 'YOUR_GOOGLE_APPS_SCRIPT_WEB_APP_URL_HERE') {
+                            setIsLoadingData(false);
+                            return; // ข้ามการ fetch ถ้ายันไม่ได้เปลี่ยน URL
+                        }
+
+                        const response = await fetch(SCRIPT_URL);
+                        const data = await response.json();
+                        
+                        if (data && Array.isArray(data)) {
+                            setRecords(data);
+                            localStorage.setItem('ct_qa_records', JSON.stringify(data));
+                        }
+                    } catch (error) {
+                        console.error('Error fetching data from Google Sheets:', error);
+                    } finally {
+                        setIsLoadingData(false);
+                        lucide.createIcons();
+                    }
+                };
+                fetchData();
+            }, []);
+
+            useEffect(() => {
+                localStorage.setItem('ct_qa_records', JSON.stringify(records));
+            }, [records]);
+
+            useEffect(() => {
+                lucide.createIcons();
+            }, [activeTab, isLoadingData]);
+
+            const handleInputChange = (e) => {
+                const { name, value, type, checked } = e.target;
+                if (type === 'checkbox') {
+                    setFormData(prev => ({ ...prev, checklist: { ...prev.checklist, [name]: checked } }));
+                } else {
+                    setFormData(prev => ({ ...prev, [name]: value }));
+                }
+            };
+
+            // 2. ส่งข้อมูลไปเซฟที่ Google Sheets (ใช้ text/plain แก้ปัญหา CORS)
+            const saveToGoogleSheets = async (recordData) => {
+                if(SCRIPT_URL === 'YOUR_GOOGLE_APPS_SCRIPT_WEB_APP_URL_HERE') return;
+                
+                try {
+                    await fetch(SCRIPT_URL, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+                        body: JSON.stringify(recordData)
+                    });
+                } catch (error) {
+                    console.error('Error syncing to Google Sheets:', error);
+                    alert('บันทึกลง Local สำเร็จ แต่การซิงค์ขึ้นระบบขัดข้อง โปรดตรวจสอบอินเทอร์เน็ต');
+                }
+            };
+
+            const handleSubmit = async (e) => {
+                e.preventDefault();
+                setIsSubmitting(true);
+                let status = 'PASS';
+                
+                // 3. ปิดช่องโหว่ Validation
+                const checks = [
+                    { val: formData.ctNum1, min: TOLERANCE.ctNumMin, max: TOLERANCE.ctNumMax },
+                    { val: formData.ctNum2, min: TOLERANCE.ctNumMin, max: TOLERANCE.ctNumMax },
+                    { val: formData.ctNum3, min: TOLERANCE.ctNumMin, max: TOLERANCE.ctNumMax },
+                    { val: formData.ctNum4, min: TOLERANCE.ctNumMin, max: TOLERANCE.ctNumMax },
+                    { val: formData.ctNum5, min: TOLERANCE.ctNumMin, max: TOLERANCE.ctNumMax },
+                    { val: formData.ctUniformity, min: TOLERANCE.unifMin, max: TOLERANCE.unifMax },
+                    { val: formData.pctImageNoise, min: TOLERANCE.pctNoiseMin, max: TOLERANCE.pctNoiseMax },
+                    { val: formData.gantryTemp, min: TOLERANCE.gantryTempMin, max: TOLERANCE.gantryTempMax },
+                    { val: formData.gantryHumid, min: TOLERANCE.gantryHumidMin, max: TOLERANCE.gantryHumidMax }
+                ];
+
+                checks.forEach(c => {
+                    if (c.val === '' || c.val === null || c.val === undefined) {
+                        status = 'FAIL';
+                    } else {
+                        const num = parseFloat(c.val);
+                        if (isNaN(num) || num < c.min || num > c.max) status = 'FAIL';
+                    }
+                });
+                
+                if (formData.hasArtifact === 'yes') status = 'FAIL';
+
+                // แก้ไขปัญหา Audit Trail: เช็คเวลาดั้งเดิมหากเป็นการแก้ไข
+                const originalRecord = editingId ? records.find(r => r.id === editingId) : null;
+                const recordData = { 
+                    timestamp: originalRecord ? originalRecord.timestamp : new Date().toISOString(), 
+                    machine: selectedMachine, 
+                    ...formData, 
+                    status 
+                };
+
+                // อัปเดต UI ทันที
+                if (editingId) {
+                    recordData.id = editingId;
+                    setRecords(prev => prev.map(r => r.id === editingId ? { ...r, ...recordData } : r));
+                    alert('QC Record Updated Successfully');
+                    setEditingId(null);
+                } else {
+                    recordData.id = generateId();
+                    setRecords([{ ...recordData }, ...records]);
+                    alert('QC Record Saved Successfully');
+                }
+
+                // ส่งไปบันทึกบน Google Sheets
+                await saveToGoogleSheets(recordData);
+
+                setIsSubmitting(false);
+                setActiveTab('dashboard');
+                resetForm();
+            };
+
+            const resetForm = () => {
+                setFormData({
+                    date: new Date().toISOString().split('T')[0], performedBy: '',
+                    gantryTemp: '', gantryHumid: '', controlTemp: '', controlHumid: '',
+                    ctNum1: '', ctNum2: '', ctNum3: '', ctNum4: '', ctNum5: '',
+                    ctUniformity: '', imageNoise: '', pctImageNoise: '',
+                    hasArtifact: 'no', artifactDesc: '',
+                    checklist: {}, analysisComment: '', testConclusion: ''
+                });
+                setEditingId(null);
+            };
+
+            const handleEdit = (record) => {
+                setEditingId(record.id);
+                setSelectedMachine(record.machine);
+                setFormData({
+                    date: record.date, performedBy: record.performedBy,
+                    gantryTemp: record.gantryTemp || '', gantryHumid: record.gantryHumid || '',
+                    controlTemp: record.controlTemp || '', controlHumid: record.controlHumid || '',
+                    ctNum1: record.ctNum1 || '', ctNum2: record.ctNum2 || '', ctNum3: record.ctNum3 || '',
+                    ctNum4: record.ctNum4 || '', ctNum5: record.ctNum5 || '',
+                    ctUniformity: record.ctUniformity || '', imageNoise: record.imageNoise || '', pctImageNoise: record.pctImageNoise || '',
+                    hasArtifact: record.hasArtifact || 'no', artifactDesc: record.artifactDesc || '',
+                    checklist: record.checklist || {}, analysisComment: record.analysisComment || '', testConclusion: record.testConclusion || ''
+                });
+                setActiveTab('new');
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+            };
+
+            const handleExportCSV = () => {
+                const headers = [
+                    'Date', 'Machine', 'User', 'Status', 'Gantry Temp', 'Gantry Humid', 'Control Temp', 'Control Humid',
+                    'CT#1', 'CT#2', 'CT#3', 'CT#4', 'CT#5', 'Uniformity', 'Noise(SD)', 'Noise(%)', 'Artifact', 'Analysis', 'Conclusion'
+                ];
+                
+                const rows = filteredRecords.map(r => [
+                    escapeCSV(r.date), escapeCSV(r.machine), escapeCSV(r.performedBy), escapeCSV(r.status), 
+                    escapeCSV(r.gantryTemp), escapeCSV(r.gantryHumid), escapeCSV(r.controlTemp), escapeCSV(r.controlHumid),
+                    escapeCSV(r.ctNum1), escapeCSV(r.ctNum2), escapeCSV(r.ctNum3), escapeCSV(r.ctNum4), escapeCSV(r.ctNum5), 
+                    escapeCSV(r.ctUniformity), escapeCSV(r.imageNoise), escapeCSV(r.pctImageNoise),
+                    escapeCSV(r.hasArtifact === 'yes' ? `Yes: ${r.artifactDesc}` : 'No'),
+                    escapeCSV(r.analysisComment), escapeCSV(r.testConclusion)
+                ]);
+                
+                const csvContent = "data:text/csv;charset=utf-8," + [headers.map(escapeCSV).join(','), ...rows.map(e => e.join(','))].join("\n");
+                const encodedUri = encodeURI(csvContent);
+                const link = document.createElement("a");
+                link.setAttribute("href", encodedUri);
+                link.setAttribute("download", `ct_qa_export_${MACHINE_PROFILES[selectedMachine].name.replace(/\s+/g, '_')}_${new Date().toISOString().slice(0,10)}.csv`);
+                document.body.appendChild(link);
+                link.click();
+                link.remove();
+            };
+
+            const handleDelete = async (id) => {
+                if (window.confirm('คุณต้องการลบข้อมูลนี้ออกจากหน้าจอใช่หรือไม่?\n(หมายเหตุ: ระบบยังไม่รองรับการลบข้อมูลบน Google Sheets อัตโนมัติ โปรดไปลบแถวใน Google Sheets ด้วยตนเอง)')) {
+                    setRecords(prev => prev.filter(r => r.id !== id));
+                }
+            };
+
+            const availableYears = useMemo(() => {
+                const years = new Set(records.map(r => new Date(r.date).getFullYear()));
+                years.add(new Date().getFullYear());
+                return Array.from(years).sort((a,b) => b-a);
+            }, [records]);
+
+            // 4. แก้บักการเรียงลำดับเวลาให้แม่นยำระดับวินาที
+            const filteredRecords = useMemo(() => {
+                return records
+                    .filter(r => {
+                        if (r.machine !== selectedMachine) return false;
+                        if (filterYear !== 'all' && new Date(r.date).getFullYear().toString() !== filterYear) return false;
+                        if (filterMonth !== 'all' && new Date(r.date).getMonth().toString() !== filterMonth) return false;
+                        return true;
+                    })
+                    .sort((a, b) => new Date(a.timestamp || a.date) - new Date(b.timestamp || b.date));
+            }, [records, selectedMachine, filterYear, filterMonth]);
+
+            const visibleChecklist = useMemo(() => {
+                return CHECKLIST_ITEMS.filter(item => !item.excludeFrom || !item.excludeFrom.includes(selectedMachine));
+            }, [selectedMachine]);
+
+            const dGantryT = filteredRecords.map(r => ({ date: r.date, value: r.gantryTemp }));
+            const dGantryH = filteredRecords.map(r => ({ date: r.date, value: r.gantryHumid }));
+            const dControlT = filteredRecords.map(r => ({ date: r.date, value: r.controlTemp }));
+            const dControlH = filteredRecords.map(r => ({ date: r.date, value: r.controlHumid }));
+
+            const dCt1 = filteredRecords.map(r => ({ date: r.date, value: r.ctNum1 }));
+            const dCt2 = filteredRecords.map(r => ({ date: r.date, value: r.ctNum2 }));
+            const dCt3 = filteredRecords.map(r => ({ date: r.date, value: r.ctNum3 }));
+            const dCt4 = filteredRecords.map(r => ({ date: r.date, value: r.ctNum4 }));
+            const dCt5 = filteredRecords.map(r => ({ date: r.date, value: r.ctNum5 }));
+            
+            const dUnif = filteredRecords.map(r => ({ date: r.date, value: r.ctUniformity }));
+            const dNoise = filteredRecords.map(r => ({ date: r.date, value: r.imageNoise }));
+            const dPctNoise = filteredRecords.map(r => ({ date: r.date, value: r.pctImageNoise }));
+
+            return (
+                <div className="min-h-screen pb-12">
+                    {/* Header */}
+                    <header className="bg-slate-900 text-white shadow-lg no-print">
+                        <div className="max-w-[95%] mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
+                            <div className="flex items-center gap-3">
+                                <div className="bg-teal-500 p-2 rounded-lg">
+                                    <i data-lucide="target" className="text-white w-6 h-6"></i>
+                                </div>
+                                <div>
+                                    <h1 className="text-xl font-bold tracking-tight">Daily QC CT</h1>
+                                    <p className="text-xs text-slate-400">Quality Control Logbook {isLoadingData && <span className="ml-2 text-teal-300 animate-pulse">(Syncing...)</span>}</p>
+                                </div>
+                            </div>
+                            <div className="flex items-center gap-4">
+                                <select 
+                                    value={selectedMachine} onChange={(e) => setSelectedMachine(e.target.value)}
+                                    className="bg-slate-800 border border-slate-700 text-white text-sm rounded-lg focus:ring-teal-500 focus:border-teal-500 block p-2.5"
+                                >
+                                    {Object.keys(MACHINE_PROFILES).map(key => (
+                                        <option key={key} value={key}>{MACHINE_PROFILES[key].name}</option>
+                                    ))}
+                                </select>
+                            </div>
+                        </div>
+                    </header>
+
+                    {/* Navigation */}
+                    <nav className="max-w-[95%] mx-auto px-4 sm:px-6 lg:px-8 py-6 no-print">
+                        <div className="flex space-x-4 border-b border-slate-200">
+                            {[
+                                { id: 'new', label: 'New Entry', icon: 'plus-circle' },
+                                { id: 'dashboard', label: 'Dashboard & Analysis', icon: 'bar-chart-2' },
+                                { id: 'history', label: 'History Log', icon: 'list' }
+                            ].map(tab => (
+                                <button
+                                    key={tab.id} onClick={() => setActiveTab(tab.id)}
+                                    className={`flex items-center gap-2 pb-3 px-1 border-b-2 font-medium text-sm transition-colors ${
+                                        activeTab === tab.id 
+                                        ? 'border-teal-600 text-teal-600' 
+                                        : 'border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300'
+                                    }`}
+                                >
+                                    <i data-lucide={tab.icon} className="w-4 h-4"></i> {tab.label}
+                                </button>
+                            ))}
+                        </div>
+                    </nav>
+
+                    {/* Content Area */}
+                    <main className="max-w-[95%] mx-auto px-4 sm:px-6 lg:px-8">
+                        
+                        {/* VIEW: NEW ENTRY */}
+                        {activeTab === 'new' && (
+                            <div className="max-w-5xl mx-auto">
+                                <div className="mb-4 flex items-center justify-between">
+                                    <h2 className="text-xl font-bold text-slate-800">{editingId ? 'Edit Entry' : 'New QC Entry'}</h2>
+                                    {editingId && (<button onClick={resetForm} className="text-sm text-red-600 hover:text-red-800 underline">Cancel Editing</button>)}
+                                </div>
+                                <form onSubmit={handleSubmit}>
+                                    
+                                    <Card title="General Information" className="mb-6">
+                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                            <div><label className="block text-sm font-medium mb-1">Date</label><input type="date" name="date" required value={formData.date} onChange={handleInputChange} className="w-full p-2 border rounded-md" /></div>
+                                            <div><label className="block text-sm font-medium mb-1">Performed By (Physicist/Tech)</label><input type="text" name="performedBy" required placeholder="e.g. John Doe" value={formData.performedBy} onChange={handleInputChange} className="w-full p-2 border rounded-md" /></div>
+                                        </div>
+                                    </Card>
+
+                                    <Card title="Visual Checklist & Environment" className="mb-6">
+                                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 mb-6">
+                                            {visibleChecklist.map((item, index) => (
+                                                <div key={item.id} className="flex items-start gap-3 p-3 border border-slate-100 rounded-lg hover:bg-slate-50">
+                                                    <input type="checkbox" id={item.id} name={item.id} checked={formData.checklist[item.id] || false} onChange={handleInputChange} className="w-5 h-5 text-teal-600 rounded mt-0.5" />
+                                                    <label htmlFor={item.id} className="text-sm font-medium text-slate-700 cursor-pointer leading-tight">
+                                                        {index + 1}. {item.label}
+                                                        {item.isWeekly && <span className="block text-[10px] text-amber-600 font-normal mt-0.5">(Weekly)</span>}
+                                                    </label>
+                                                </div>
+                                            ))}
+                                        </div>
+                                        
+                                        <h4 className="font-semibold text-slate-700 mb-3 border-t pt-4">Room Environment</h4>
+                                        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                                            <div>
+                                                <label className="block text-xs font-bold text-slate-500 uppercase mb-1">
+                                                    Gantry Room Temp (°C)
+                                                    <span className="block text-[10px] text-slate-400 normal-case font-normal mt-0.5">Range: 18-24°C</span>
+                                                </label>
+                                                <input type="number" name="gantryTemp" required step="0.1" value={formData.gantryTemp} onChange={handleInputChange} className={`w-full p-2 border rounded-md mt-1 ${parseFloat(formData.gantryTemp) < TOLERANCE.gantryTempMin || parseFloat(formData.gantryTemp) > TOLERANCE.gantryTempMax ? 'border-red-500 bg-red-50' : ''}`} />
+                                            </div>
+                                            <div>
+                                                <label className="block text-xs font-bold text-slate-500 uppercase mb-1">
+                                                    Gantry Room Humid (%)
+                                                    <span className="block text-[10px] text-slate-400 normal-case font-normal mt-0.5">Range: 40-70%</span>
+                                                </label>
+                                                <input type="number" name="gantryHumid" required step="0.1" value={formData.gantryHumid} onChange={handleInputChange} className={`w-full p-2 border rounded-md mt-1 ${parseFloat(formData.gantryHumid) < TOLERANCE.gantryHumidMin || parseFloat(formData.gantryHumid) > TOLERANCE.gantryHumidMax ? 'border-red-500 bg-red-50' : ''}`} />
+                                            </div>
+                                            <div>
+                                                <label className="block text-xs font-bold text-slate-500 uppercase mb-1">
+                                                    Control Room Temp (°C)
+                                                    <span className="block text-[10px] text-transparent normal-case font-normal mt-0.5">.</span>
+                                                </label>
+                                                <input type="number" name="controlTemp" step="0.1" value={formData.controlTemp} onChange={handleInputChange} className="w-full p-2 border rounded-md mt-1" />
+                                            </div>
+                                            <div>
+                                                <label className="block text-xs font-bold text-slate-500 uppercase mb-1">
+                                                    Control Room Humid (%)
+                                                    <span className="block text-[10px] text-transparent normal-case font-normal mt-0.5">.</span>
+                                                </label>
+                                                <input type="number" name="controlHumid" step="0.1" value={formData.controlHumid} onChange={handleInputChange} className="w-full p-2 border rounded-md mt-1" />
+                                            </div>
+                                        </div>
+                                    </Card>
+
+                                    <Card title="Water Phantom Scanning" className="mb-6 border-l-4 border-l-teal-500">
+                                        <div className="mb-4">
+                                            <h4 className="text-sm font-bold text-slate-700 mb-2">CT number accuracy in location 1-5 (HU) <span className="text-xs text-slate-400 font-normal ml-2">Tolerance: -5 to +5 HU</span></h4>
+                                            <div className="grid grid-cols-5 gap-2">
+                                                <input type="number" name="ctNum1" required step="0.1" placeholder="Loc 1" value={formData.ctNum1} onChange={handleInputChange} className={`w-full p-2 border rounded-md ${parseFloat(formData.ctNum1) < -5 || parseFloat(formData.ctNum1) > 5 ? 'border-red-500 bg-red-50' : ''}`} />
+                                                <input type="number" name="ctNum2" required step="0.1" placeholder="Loc 2" value={formData.ctNum2} onChange={handleInputChange} className={`w-full p-2 border rounded-md ${parseFloat(formData.ctNum2) < -5 || parseFloat(formData.ctNum2) > 5 ? 'border-red-500 bg-red-50' : ''}`} />
+                                                <input type="number" name="ctNum3" required step="0.1" placeholder="Loc 3" value={formData.ctNum3} onChange={handleInputChange} className={`w-full p-2 border rounded-md ${parseFloat(formData.ctNum3) < -5 || parseFloat(formData.ctNum3) > 5 ? 'border-red-500 bg-red-50' : ''}`} />
+                                                <input type="number" name="ctNum4" required step="0.1" placeholder="Loc 4" value={formData.ctNum4} onChange={handleInputChange} className={`w-full p-2 border rounded-md ${parseFloat(formData.ctNum4) < -5 || parseFloat(formData.ctNum4) > 5 ? 'border-red-500 bg-red-50' : ''}`} />
+                                                <input type="number" name="ctNum5" required step="0.1" placeholder="Loc 5" value={formData.ctNum5} onChange={handleInputChange} className={`w-full p-2 border rounded-md ${parseFloat(formData.ctNum5) < -5 || parseFloat(formData.ctNum5) > 5 ? 'border-red-500 bg-red-50' : ''}`} />
+                                            </div>
+                                        </div>
+
+                                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-4">
+                                            <div>
+                                                <label className="block text-sm font-bold text-slate-700 mb-1">CT number uniformity (HU) <span className="block text-[10px] text-slate-400 font-normal">Tolerance: -10 to +10 HU</span></label>
+                                                <input type="number" name="ctUniformity" required step="0.1" value={formData.ctUniformity} onChange={handleInputChange} className={`w-full p-2 border rounded-md mt-1 ${parseFloat(formData.ctUniformity) < -10 || parseFloat(formData.ctUniformity) > 10 ? 'border-red-500 bg-red-50' : ''}`} />
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-bold text-slate-700 mb-1">Image noise (SD) <span className="block text-[10px] text-slate-400 font-normal">No tolerance</span></label>
+                                                <input type="number" name="imageNoise" required step="0.1" value={formData.imageNoise} onChange={handleInputChange} className="w-full p-2 border rounded-md mt-1" />
+                                            </div>
+                                            <div>
+                                                <label className="block text-sm font-bold text-slate-700 mb-1">Percentage Image noise (%) <span className="block text-[10px] text-slate-400 font-normal">Tolerance: -25% to +25%</span></label>
+                                                <input type="number" name="pctImageNoise" required step="0.1" value={formData.pctImageNoise} onChange={handleInputChange} className={`w-full p-2 border rounded-md mt-1 ${parseFloat(formData.pctImageNoise) < -25 || parseFloat(formData.pctImageNoise) > 25 ? 'border-red-500 bg-red-50' : ''}`} />
+                                            </div>
+                                        </div>
+
+                                        <div className="border-t pt-4 mt-4">
+                                            <label className="block text-sm font-bold text-slate-700 mb-2">Image Artifact (Yes / No)</label>
+                                            <div className="flex gap-4 items-center">
+                                                <select name="hasArtifact" value={formData.hasArtifact} onChange={handleInputChange} className="p-2 border rounded-md bg-white w-32">
+                                                    <option value="no">No</option>
+                                                    <option value="yes">Yes</option>
+                                                </select>
+                                                {formData.hasArtifact === 'yes' && (
+                                                    <input type="text" name="artifactDesc" required placeholder="Specify suspected artifacts..." value={formData.artifactDesc} onChange={handleInputChange} className="flex-1 p-2 border rounded-md border-red-300 bg-red-50" />
+                                                )}
+                                            </div>
+                                        </div>
+                                    </Card>
+
+                                    <Card title="Physicist's Analysis & Conclusion" className="mb-6">
+                                        <div className="space-y-4">
+                                            <div><label className="block text-sm font-medium mb-1">Analysis Result</label><textarea name="analysisComment" rows="3" value={formData.analysisComment} onChange={handleInputChange} className="w-full p-2 border rounded-md resize-none"></textarea></div>
+                                            <div><label className="block text-sm font-medium mb-1">Test Conclusion</label><textarea name="testConclusion" rows="2" value={formData.testConclusion} onChange={handleInputChange} className="w-full p-2 border rounded-md resize-none"></textarea></div>
+                                        </div>
+                                    </Card>
+
+                                    <div className="flex justify-end gap-3">
+                                        <button type="button" onClick={resetForm} disabled={isSubmitting} className="px-4 py-2 text-slate-600 hover:bg-slate-100 rounded-lg">Reset</button>
+                                        <button type="submit" disabled={isSubmitting} className="px-6 py-2 bg-teal-600 text-white rounded-lg hover:bg-teal-700 flex items-center gap-2 disabled:bg-teal-400 disabled:cursor-wait transition-colors">
+                                            {isSubmitting ? <i data-lucide="loader" className="w-4 h-4 animate-spin"></i> : <i data-lucide={editingId ? "save" : "plus-circle"} className="w-4 h-4"></i>}
+                                            {editingId ? 'Update Record' : 'Save QC Record'}
+                                        </button>
+                                    </div>
+                                </form>
+                            </div>
+                        )}
+
+                        {/* VIEW: DASHBOARD */}
+                        {activeTab === 'dashboard' && (
+                            <div className="space-y-6">
+                                {filteredRecords.length === 0 ? (
+                                    <div className="text-center py-20 bg-white rounded-xl border border-dashed border-slate-300">
+                                        <i data-lucide="bar-chart-2" className="w-12 h-12 text-slate-300 mx-auto mb-3"></i>
+                                        <p className="text-slate-500">No data available for {MACHINE_PROFILES[selectedMachine].name}.</p>
+                                    </div>
+                                ) : (
+                                    <>
+                                        <h3 className="text-lg font-bold text-slate-800 mb-2 border-l-4 border-teal-600 pl-3">Water Phantom Scanning Trend</h3>
+                                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-8">
+                                            <Card title="CT# Accuracy Loc 1"><div className="h-64"><TrendChart data={dCt1} label="Loc 1 (HU)" color="#3b82f6" upperLimit={TOLERANCE.ctNumMax} lowerLimit={TOLERANCE.ctNumMin} /></div></Card>
+                                            <Card title="CT# Accuracy Loc 2"><div className="h-64"><TrendChart data={dCt2} label="Loc 2 (HU)" color="#3b82f6" upperLimit={TOLERANCE.ctNumMax} lowerLimit={TOLERANCE.ctNumMin} /></div></Card>
+                                            <Card title="CT# Accuracy Loc 3"><div className="h-64"><TrendChart data={dCt3} label="Loc 3 (HU)" color="#3b82f6" upperLimit={TOLERANCE.ctNumMax} lowerLimit={TOLERANCE.ctNumMin} /></div></Card>
+                                            <Card title="CT# Accuracy Loc 4"><div className="h-64"><TrendChart data={dCt4} label="Loc 4 (HU)" color="#3b82f6" upperLimit={TOLERANCE.ctNumMax} lowerLimit={TOLERANCE.ctNumMin} /></div></Card>
+                                            <Card title="CT# Accuracy Loc 5"><div className="h-64"><TrendChart data={dCt5} label="Loc 5 (HU)" color="#3b82f6" upperLimit={TOLERANCE.ctNumMax} lowerLimit={TOLERANCE.ctNumMin} /></div></Card>
+                                            <Card title="CT Number Uniformity"><div className="h-64"><TrendChart data={dUnif} label="Uniformity (HU)" color="#8b5cf6" upperLimit={TOLERANCE.unifMax} lowerLimit={TOLERANCE.unifMin} /></div></Card>
+                                            <Card title="Image Noise (SD)"><div className="h-64"><TrendChart data={dNoise} label="Noise (SD)" color="#f59e0b" showLimits={false} /></div></Card>
+                                            <Card title="% Image Noise"><div className="h-64"><TrendChart data={dPctNoise} label="% Noise" color="#ec4899" upperLimit={TOLERANCE.pctNoiseMax} lowerLimit={TOLERANCE.pctNoiseMin} /></div></Card>
+                                        </div>
+
+                                        <h3 className="text-lg font-bold text-slate-800 mb-2 border-l-4 border-teal-600 pl-3">Room Environment Trend</h3>
+                                        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                                            <Card title="Gantry Temp (°C)"><div className="h-48"><TrendChart data={dGantryT} label="G. Temp" color="#ef4444" upperLimit={TOLERANCE.gantryTempMax} lowerLimit={TOLERANCE.gantryTempMin} showLimits={true} /></div></Card>
+                                            <Card title="Gantry Humidity (%)"><div className="h-48"><TrendChart data={dGantryH} label="G. Humid" color="#06b6d4" upperLimit={TOLERANCE.gantryHumidMax} lowerLimit={TOLERANCE.gantryHumidMin} showLimits={true} /></div></Card>
+                                            <Card title="Control Temp (°C)"><div className="h-48"><TrendChart data={dControlT} label="C. Temp" color="#ef4444" showLimits={false} /></div></Card>
+                                            <Card title="Control Humidity (%)"><div className="h-48"><TrendChart data={dControlH} label="C. Humid" color="#06b6d4" showLimits={false} /></div></Card>
+                                        </div>
+                                    </>
+                                )}
+                            </div>
+                        )}
+
+                        {/* VIEW: HISTORY */}
+                        {activeTab === 'history' && (
+                            <Card title="Recorded History" className="no-print">
+                                <div className="mb-6 p-4 bg-slate-50 rounded-lg border flex flex-wrap gap-4 items-end">
+                                    <div><label className="block text-xs font-semibold text-slate-500 mb-1">Year</label><select value={filterYear} onChange={(e) => setFilterYear(e.target.value)} className="p-2 border rounded"><option value="all">All Years</option>{availableYears.map(y => (<option key={y} value={y}>{y}</option>))}</select></div>
+                                    <div><label className="block text-xs font-semibold text-slate-500 mb-1">Month</label><select value={filterMonth} onChange={(e) => setFilterMonth(e.target.value)} className="p-2 border rounded"><option value="all">All Months</option><option value="0">Jan</option><option value="1">Feb</option><option value="2">Mar</option><option value="3">Apr</option><option value="4">May</option><option value="5">Jun</option><option value="6">Jul</option><option value="7">Aug</option><option value="8">Sep</option><option value="9">Oct</option><option value="10">Nov</option><option value="11">Dec</option></select></div>
+                                </div>
+                                <div className="flex justify-between items-center mb-4">
+                                    <div className="text-sm text-slate-500">Showing {filteredRecords.length} records</div>
+                                    <div className="flex gap-2">
+                                        <button onClick={() => setActiveTab('report')} className="px-3 py-1.5 text-sm bg-teal-50 text-teal-700 border rounded flex items-center gap-2"><i data-lucide="file-text" className="w-4 h-4"></i> View Report</button>
+                                        <button onClick={handleExportCSV} className="px-3 py-1.5 text-sm border rounded flex items-center gap-2"><i data-lucide="download" className="w-4 h-4"></i> Export CSV</button>
+                                    </div>
+                                </div>
+                                <div className="overflow-x-auto">
+                                    <table className="w-full text-xs text-left whitespace-nowrap">
+                                        <thead className="bg-slate-50 border-b">
+                                            <tr>
+                                                <th className="px-2 py-3 border-r">Date</th>
+                                                <th className="px-2 py-3 border-r">Stat</th>
+                                                <th className="px-2 py-3 text-right border-r">L1</th>
+                                                <th className="px-2 py-3 text-right border-r">L2</th>
+                                                <th className="px-2 py-3 text-right border-r">L3</th>
+                                                <th className="px-2 py-3 text-right border-r">L4</th>
+                                                <th className="px-2 py-3 text-right border-r">L5</th>
+                                                <th className="px-2 py-3 text-right border-r">Unif</th>
+                                                <th className="px-2 py-3 text-right border-r">Ns</th>
+                                                <th className="px-2 py-3 text-right border-r">%Ns</th>
+                                                <th className="px-2 py-3 text-center border-r">Artf</th>
+                                                <th className="px-2 py-3 text-center">Act</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            {filteredRecords.map((r) => (
+                                                <tr key={r.id} className="border-b hover:bg-slate-50">
+                                                    <td className="px-2 py-2 border-r">{formatDate(r.date)}</td>
+                                                    <td className="px-2 py-2 border-r"><span className={`px-1 rounded font-bold ${r.status==='PASS'?'text-green-600':'text-red-600'}`}>{r.status==='PASS'?'P':'F'}</span></td>
+                                                    <td className="px-2 py-2 text-right border-r font-mono">{r.ctNum1}</td>
+                                                    <td className="px-2 py-2 text-right border-r font-mono">{r.ctNum2}</td>
+                                                    <td className="px-2 py-2 text-right border-r font-mono">{r.ctNum3}</td>
+                                                    <td className="px-2 py-2 text-right border-r font-mono">{r.ctNum4}</td>
+                                                    <td className="px-2 py-2 text-right border-r font-mono">{r.ctNum5}</td>
+                                                    <td className="px-2 py-2 text-right border-r font-mono">{r.ctUniformity}</td>
+                                                    <td className="px-2 py-2 text-right border-r font-mono">{r.imageNoise}</td>
+                                                    <td className="px-2 py-2 text-right border-r font-mono">{r.pctImageNoise}</td>
+                                                    <td className="px-2 py-2 text-center border-r text-[10px]">{r.hasArtifact==='yes'? <span className="text-red-500 font-bold" title={r.artifactDesc}>Yes</span>:'No'}</td>
+                                                    <td className="px-2 py-2 text-center">
+                                                        <div className="flex justify-center gap-1">
+                                                            <button onClick={()=>handleEdit(r)} className="text-blue-500"><i data-lucide="edit-2" className="w-4 h-4"></i></button>
+                                                            <button onClick={()=>handleDelete(r.id)} className="text-red-500"><i data-lucide="trash-2" className="w-4 h-4"></i></button>
+                                                        </div>
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                            {filteredRecords.length === 0 && (<tr><td colSpan="12" className="py-8 text-center text-slate-400">No records found.</td></tr>)}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </Card>
+                        )}
+
+                        {/* VIEW: FULL REPORT */}
+                        {activeTab === 'report' && (
+                            <div className="bg-white rounded-xl shadow-lg p-8 min-h-screen">
+                                <div className="no-print flex justify-between items-center mb-8 border-b pb-4">
+                                     <button onClick={() => setActiveTab('history')} className="flex items-center gap-2 text-slate-600 hover:bg-slate-100 px-3 py-2 rounded-lg">
+                                        <i data-lucide="arrow-left" className="w-5 h-5"></i> Back
+                                    </button>
+                                    <button onClick={() => window.print()} className="bg-teal-600 text-white px-5 py-2.5 rounded-lg flex items-center gap-2 font-medium">
+                                        <i data-lucide="printer" className="w-5 h-5"></i> Print / PDF
+                                    </button>
+                                </div>
+
+                                <div id="report-content">
+                                    <div className="text-center mb-8 border-b-2 border-slate-800 pb-4">
+                                         <h1 className="text-2xl font-extrabold text-slate-900 uppercase">CT Quality Control Report</h1>
+                                         <h2 className="text-lg font-semibold text-slate-700 mt-1">{MACHINE_PROFILES[selectedMachine].name}</h2>
+                                         <div className="flex justify-center gap-8 mt-2 text-xs text-slate-600">
+                                            <p>Period: {filterMonth !== 'all' ? new Date(0, filterMonth).toLocaleString('default', { month: 'long' }) : 'All Months'} {filterYear !== 'all' ? filterYear : 'All Years'}</p>
+                                            <p>Records: {filteredRecords.length}</p>
+                                            <p>Generated: {new Date().toLocaleDateString()}</p>
+                                         </div>
+                                    </div>
+
+                                    {/* Charts */}
+                                    {filteredRecords.length > 0 && (
+                                        <div className="mb-8">
+                                            <h3 className="text-base font-bold text-slate-800 mb-4 border-l-4 border-teal-600 pl-2">Water Phantom Trend</h3>
+                                            <div className="grid grid-cols-1 gap-4">
+                                                <div className="border rounded-lg p-3 break-inside-avoid bg-white"><h4 className="text-center font-bold text-xs mb-1">CT# Accuracy Loc 1</h4><div className="h-48"><TrendChart data={dCt1} label="Loc 1 (HU)" color="#3b82f6" upperLimit={TOLERANCE.ctNumMax} lowerLimit={TOLERANCE.ctNumMin} /></div></div>
+                                                <div className="border rounded-lg p-3 break-inside-avoid bg-white"><h4 className="text-center font-bold text-xs mb-1">CT# Accuracy Loc 2</h4><div className="h-48"><TrendChart data={dCt2} label="Loc 2 (HU)" color="#3b82f6" upperLimit={TOLERANCE.ctNumMax} lowerLimit={TOLERANCE.ctNumMin} /></div></div>
+                                                <div className="border rounded-lg p-3 break-inside-avoid bg-white"><h4 className="text-center font-bold text-xs mb-1">CT# Accuracy Loc 3</h4><div className="h-48"><TrendChart data={dCt3} label="Loc 3 (HU)" color="#3b82f6" upperLimit={TOLERANCE.ctNumMax} lowerLimit={TOLERANCE.ctNumMin} /></div></div>
+                                                <div className="border rounded-lg p-3 break-inside-avoid bg-white"><h4 className="text-center font-bold text-xs mb-1">CT# Accuracy Loc 4</h4><div className="h-48"><TrendChart data={dCt4} label="Loc 4 (HU)" color="#3b82f6" upperLimit={TOLERANCE.ctNumMax} lowerLimit={TOLERANCE.ctNumMin} /></div></div>
+                                                <div className="border rounded-lg p-3 break-inside-avoid bg-white"><h4 className="text-center font-bold text-xs mb-1">CT# Accuracy Loc 5</h4><div className="h-48"><TrendChart data={dCt5} label="Loc 5 (HU)" color="#3b82f6" upperLimit={TOLERANCE.ctNumMax} lowerLimit={TOLERANCE.ctNumMin} /></div></div>
+                                                <div className="border rounded-lg p-3 break-inside-avoid bg-white"><h4 className="text-center font-bold text-xs mb-1">CT Number Uniformity</h4><div className="h-48"><TrendChart data={dUnif} label="Uniformity (HU)" color="#8b5cf6" upperLimit={TOLERANCE.unifMax} lowerLimit={TOLERANCE.unifMin} /></div></div>
+                                                <div className="border rounded-lg p-3 break-inside-avoid bg-white"><h4 className="text-center font-bold text-xs mb-1">Image Noise (SD)</h4><div className="h-48"><TrendChart data={dNoise} label="Noise (SD)" color="#f59e0b" showLimits={false} /></div></div>
+                                                <div className="border rounded-lg p-3 break-inside-avoid bg-white"><h4 className="text-center font-bold text-xs mb-1">Percentage Image Noise (%)</h4><div className="h-48"><TrendChart data={dPctNoise} label="% Noise" color="#ec4899" upperLimit={TOLERANCE.pctNoiseMax} lowerLimit={TOLERANCE.pctNoiseMin} /></div></div>
+                                            </div>
+
+                                            <h3 className="text-base font-bold text-slate-800 mt-8 mb-4 border-l-4 border-teal-600 pl-2">Environment Trend</h3>
+                                            <div className="grid grid-cols-1 gap-4">
+                                                <div className="border rounded-lg p-3 break-inside-avoid bg-white"><h4 className="text-center font-bold text-xs mb-1">Gantry Room Temp (°C)</h4><div className="h-48"><TrendChart data={dGantryT} label="G. Temp" color="#ef4444" upperLimit={TOLERANCE.gantryTempMax} lowerLimit={TOLERANCE.gantryTempMin} showLimits={true} /></div></div>
+                                                <div className="border rounded-lg p-3 break-inside-avoid bg-white"><h4 className="text-center font-bold text-xs mb-1">Gantry Room Humidity (%)</h4><div className="h-48"><TrendChart data={dGantryH} label="G. Humid" color="#06b6d4" upperLimit={TOLERANCE.gantryHumidMax} lowerLimit={TOLERANCE.gantryHumidMin} showLimits={true} /></div></div>
+                                                <div className="border rounded-lg p-3 break-inside-avoid bg-white"><h4 className="text-center font-bold text-xs mb-1">Control Room Temp (°C)</h4><div className="h-48"><TrendChart data={dControlT} label="C. Temp" color="#ef4444" showLimits={false} /></div></div>
+                                                <div className="border rounded-lg p-3 break-inside-avoid bg-white"><h4 className="text-center font-bold text-xs mb-1">Control Room Humidity (%)</h4><div className="h-48"><TrendChart data={dControlH} label="C. Humid" color="#06b6d4" showLimits={false} /></div></div>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    <div className="page-break"></div>
+
+                                    {/* Data Table */}
+                                    <div className="mt-4 mb-8">
+                                         <h3 className="text-base font-bold text-slate-800 mb-3 border-l-4 border-teal-600 pl-2">Detailed Data Log</h3>
+                                         <div className="overflow-hidden">
+                                            <table className="w-full text-[8px] text-center border-collapse">
+                                                <thead className="bg-slate-100 border-b-2">
+                                                    <tr>
+                                                        <th className="p-1 border border-slate-200">Date</th><th className="p-1 border border-slate-200">Stat</th><th className="p-1 border border-slate-200">L1</th><th className="p-1 border border-slate-200">L2</th><th className="p-1 border border-slate-200">L3</th><th className="p-1 border border-slate-200">L4</th><th className="p-1 border border-slate-200">L5</th><th className="p-1 border border-slate-200">Unif</th><th className="p-1 border border-slate-200">Ns</th><th className="p-1 border border-slate-200">%Ns</th><th className="p-1 border border-slate-200">Artf</th><th className="p-1 border border-slate-200" title="Gantry Temp">GT</th><th className="p-1 border border-slate-200" title="Control Temp">CT</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody>
+                                                    {filteredRecords.map((r, idx) => (
+                                                        <tr key={r.id} className={idx % 2 === 0 ? 'bg-white' : 'bg-slate-50'}>
+                                                            <td className="p-1 border border-slate-200 whitespace-nowrap">{formatDate(r.date)}</td>
+                                                            <td className={`p-1 border border-slate-200 font-bold ${r.status==='PASS'?'text-green-600':'text-red-600'}`}>{r.status==='PASS'?'P':'F'}</td>
+                                                            <td className="p-1 border border-slate-200 font-mono">{r.ctNum1}</td><td className="p-1 border border-slate-200 font-mono">{r.ctNum2}</td><td className="p-1 border border-slate-200 font-mono">{r.ctNum3}</td><td className="p-1 border border-slate-200 font-mono">{r.ctNum4}</td><td className="p-1 border border-slate-200 font-mono">{r.ctNum5}</td><td className="p-1 border border-slate-200 font-mono">{r.ctUniformity}</td><td className="p-1 border border-slate-200 font-mono">{r.imageNoise}</td><td className="p-1 border border-slate-200 font-mono">{r.pctImageNoise}</td><td className="p-1 border border-slate-200 text-[8px]">{r.hasArtifact==='yes'?'Yes':'No'}</td><td className="p-1 border border-slate-200 font-mono">{r.gantryTemp}</td><td className="p-1 border border-slate-200 font-mono">{r.controlTemp}</td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                            </table>
+                                         </div>
+                                    </div>
+
+                                    {/* Latest Checklist & Conclusion */}
+                                    <div className="break-inside-avoid">
+                                        <div className="pt-4 border-t-2 border-slate-300">
+                                            <h3 className="text-base font-bold text-slate-800 mb-3 border-l-4 border-teal-600 pl-2">Visual Checklist & Environment (Latest Entry)</h3>
+                                            <div className="bg-slate-50 p-3 rounded border border-slate-200 grid grid-cols-2 sm:grid-cols-4 gap-2">
+                                                {visibleChecklist.map((item, index) => {
+                                                    const latestRecord = filteredRecords[filteredRecords.length-1];
+                                                    const isChecked = latestRecord?.checklist?.[item.id];
+                                                    return (
+                                                        <div key={item.id} className="flex items-start gap-1.5"><span className={`text-[10px] ${isChecked ? 'text-green-600' : 'text-slate-400'}`}>{isChecked ? '☑' : '☐'}</span><span className={`text-[9px] leading-tight ${isChecked ? 'text-slate-700' : 'text-slate-400'}`}>{index + 1}. {item.label}</span></div>
+                                                    );
+                                                })}
+                                            </div>
+                                        </div>
+
+                                        <div className="mt-6 pt-4 border-t">
+                                            <h3 className="text-base font-bold text-slate-800 mb-3 border-l-4 border-teal-600 pl-2">Physicist's Analysis & Conclusion (Latest Entry)</h3>
+                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                                <div className="bg-slate-50 p-3 rounded border"><h4 className="font-semibold text-slate-700 mb-1 text-xs">Analysis Result</h4><p className="text-[10px] text-slate-600 whitespace-pre-wrap min-h-[40px]">{filteredRecords[filteredRecords.length-1]?.analysisComment || '-'}</p></div>
+                                                <div className="bg-slate-50 p-3 rounded border"><h4 className="font-semibold text-slate-700 mb-1 text-xs">Test Conclusion</h4><p className="text-[10px] text-slate-600 whitespace-pre-wrap min-h-[40px]">{filteredRecords[filteredRecords.length-1]?.testConclusion || '-'}</p></div>
+                                            </div>
+                                        </div>
+
+                                        <div className="mt-12 grid grid-cols-2 gap-16 px-8">
+                                            <div><div className="border-b border-black h-6"></div><p className="mt-2 text-xs font-medium text-center">Reviewing Medical Physicist</p></div>
+                                            <div><div className="border-b border-black h-6"></div><p className="mt-2 text-xs font-medium text-center">Date</p></div>
+                                        </div>
+                                        <div className="mt-8 pt-4 border-t text-center">
+                                            <p className="text-[10px] font-semibold text-slate-600">Prepared by Diagnostic Radiology Medical Physics Team, Faculty of Medicine, Prince of Songkla University</p>
+                                        </div>
+                                    </div>
+
+                                </div>
+                            </div>
+                        )}
+                    </main>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
