@@ -91,7 +91,7 @@
 
         // --- Components ---
         const Card = ({ title, children, className = "" }) => (
-            <div className={`bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden ${className}`}>
+            <div className={`bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden break-inside-avoid ${className}`}>
                 {title && <div className="px-6 py-4 border-b border-slate-100 font-semibold text-slate-700">{title}</div>}
                 <div className="p-6">{children}</div>
             </div>
@@ -176,9 +176,9 @@
                         const savedRecords = localStorage.getItem('ct_qa_records');
                         if (savedRecords) setRecords(JSON.parse(savedRecords));
 
-                        if(SCRIPT_URL === 'YOUR_GOOGLE_APPS_SCRIPT_WEB_APP_URL_HERE') {
+                        if(SCRIPT_URL === 'YOUR_GOOGLE_APPS_SCRIPT_WEB_APP_URL_HERE' || SCRIPT_URL.includes('YOUR_GOOGLE')) {
                             setIsLoadingData(false);
-                            return; // ข้ามการ fetch ถ้ายันไม่ได้เปลี่ยน URL
+                            return;
                         }
 
                         const response = await fetch(SCRIPT_URL);
@@ -192,7 +192,7 @@
                         console.error('Error fetching data from Google Sheets:', error);
                     } finally {
                         setIsLoadingData(false);
-                        lucide.createIcons();
+                        setTimeout(() => lucide.createIcons(), 50);
                     }
                 };
                 fetchData();
@@ -202,8 +202,12 @@
                 localStorage.setItem('ct_qa_records', JSON.stringify(records));
             }, [records]);
 
+            // บังคับทำลายและสร้างไอคอนใหม่ทุกครั้งที่แท็บเปลี่ยน (แก้บักไอคอนหายในบาง View)
             useEffect(() => {
-                lucide.createIcons();
+                const timer = setTimeout(() => {
+                    lucide.createIcons();
+                }, 60);
+                return () => clearTimeout(timer);
             }, [activeTab, isLoadingData]);
 
             const handleInputChange = (e) => {
@@ -215,13 +219,14 @@
                 }
             };
 
-            // 2. ส่งข้อมูลไปเซฟที่ Google Sheets (ใช้ text/plain แก้ปัญหา CORS)
+            // 2. ส่งข้อมูลไปเซฟที่ Google Sheets (เปิดโหมด no-cors เพื่อปิดช่องโหว่การบล็อกของ Browser)
             const saveToGoogleSheets = async (recordData) => {
-                if(SCRIPT_URL === 'YOUR_GOOGLE_APPS_SCRIPT_WEB_APP_URL_HERE') return;
+                if(SCRIPT_URL === 'YOUR_GOOGLE_APPS_SCRIPT_WEB_APP_URL_HERE' || SCRIPT_URL.includes('YOUR_GOOGLE')) return;
                 
                 try {
                     await fetch(SCRIPT_URL, {
                         method: 'POST',
+                        mode: 'no-cors', 
                         headers: { 'Content-Type': 'text/plain;charset=utf-8' },
                         body: JSON.stringify(recordData)
                     });
@@ -236,7 +241,7 @@
                 setIsSubmitting(true);
                 let status = 'PASS';
                 
-                // 3. ปิดช่องโหว่ Validation
+                // 3. Validation เช็คช่วงความคลาดเคลื่อนทางรังสีวิทยา
                 const checks = [
                     { val: formData.ctNum1, min: TOLERANCE.ctNumMin, max: TOLERANCE.ctNumMax },
                     { val: formData.ctNum2, min: TOLERANCE.ctNumMin, max: TOLERANCE.ctNumMax },
@@ -260,7 +265,6 @@
                 
                 if (formData.hasArtifact === 'yes') status = 'FAIL';
 
-                // แก้ไขปัญหา Audit Trail: เช็คเวลาดั้งเดิมหากเป็นการแก้ไข
                 const originalRecord = editingId ? records.find(r => r.id === editingId) : null;
                 const recordData = { 
                     timestamp: originalRecord ? originalRecord.timestamp : new Date().toISOString(), 
@@ -269,7 +273,6 @@
                     status 
                 };
 
-                // อัปเดต UI ทันที
                 if (editingId) {
                     recordData.id = editingId;
                     setRecords(prev => prev.map(r => r.id === editingId ? { ...r, ...recordData } : r));
@@ -281,7 +284,6 @@
                     alert('QC Record Saved Successfully');
                 }
 
-                // ส่งไปบันทึกบน Google Sheets
                 await saveToGoogleSheets(recordData);
 
                 setIsSubmitting(false);
@@ -355,7 +357,7 @@
                 return Array.from(years).sort((a,b) => b-a);
             }, [records]);
 
-            // 4. แก้บักการเรียงลำดับเวลาให้แม่นยำระดับวินาที
+            // 4. เรียงลำดับเวลาความละเอียดระดับมิลลิวินาที
             const filteredRecords = useMemo(() => {
                 return records
                     .filter(r => {
@@ -705,7 +707,7 @@
                                     <div className="page-break"></div>
 
                                     {/* Data Table */}
-                                    <div className="mt-4 mb-8">
+                                    <div className="mt-4 mb-8 break-inside-avoid">
                                          <h3 className="text-base font-bold text-slate-800 mb-3 border-l-4 border-teal-600 pl-2">Detailed Data Log</h3>
                                          <div className="overflow-hidden">
                                             <table className="w-full text-[8px] text-center border-collapse">
